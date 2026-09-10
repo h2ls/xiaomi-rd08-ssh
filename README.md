@@ -1,5 +1,7 @@
 # 小米路由器 BE6500 Pro (RD08) 固件 1.1.96 SSH 开启 — 全过程文档
 
+> **声明**：本项目的漏洞分析过程、利用脚本与文档由月之暗面（Moonshot AI）的 K3 模型（Kimi Code）实现，仅供学习与研究使用。请勿用于未经授权的设备或任何非法用途，使用者须自行承担一切后果。
+
 > 适用对象：固件 1.1.96（已带 hackCheck v3 字符过滤，xmir-patcher 全部 exploit 失效）的小米 RD08。
 > 核心成果：发现并验证一个新注入点（`set_macfilter_rules` 的 `name` 参数），认证后 root RCE，一键开 SSH。
 > 配套脚本：[`rd08_ssh_enable.py`](./rd08_ssh_enable.py)（实测可用）。
