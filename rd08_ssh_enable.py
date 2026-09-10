@@ -236,21 +236,26 @@ sed -i 's/channel=.*/channel="debug"/g' /etc/init.d/dropbear
 /etc/init.d/dropbear restart
 """
 
+def _install_auto_ssh(sh):
+    """通过已有 shell 安装 auto_ssh 开机自启 (base64 传输避免引号问题)"""
+    import base64
+    b64 = base64.b64encode(AUTO_SSH.encode()).decode()
+    for c in [
+        'mkdir -p /data/auto_ssh',
+        f'echo {b64} | base64 -d > /data/auto_ssh/auto_ssh.sh',
+        'chmod +x /data/auto_ssh/auto_ssh.sh',
+        "uci set firewall.auto_ssh=include",
+        "uci set firewall.auto_ssh.type='script'",
+        "uci set firewall.auto_ssh.path='/data/auto_ssh/auto_ssh.sh'",
+        "uci set firewall.auto_ssh.enabled='1'",
+        "uci commit firewall",
+    ]:
+        sh.run(c)
+
 def soft_persist(ip, rootpw):
     sh = get_shell(ip, rootpw)
     try:
-        cmds = [
-            'mkdir -p /data/auto_ssh',
-            "printf '%s' '" + AUTO_SSH.replace("'", "'\\''") + "' > /data/auto_ssh/auto_ssh.sh",
-            'chmod +x /data/auto_ssh/auto_ssh.sh',
-            "uci set firewall.auto_ssh=include",
-            "uci set firewall.auto_ssh.type='script'",
-            "uci set firewall.auto_ssh.path='/data/auto_ssh/auto_ssh.sh'",
-            "uci set firewall.auto_ssh.enabled='1'",
-            "uci commit firewall",
-        ]
-        for c in cmds:
-            sh.run(c)
+        _install_auto_ssh(sh)
         out = sh.run('uci get firewall.auto_ssh.path')
         return 'auto_ssh.sh' in out
     finally:
@@ -267,7 +272,7 @@ def wait_router_down(ip):
         time.sleep(5)
     return False
 
-def wait_router_up(ip, rootpw, timeout=240):
+def wait_router_up(ip, rootpw, timeout=420):
     print('  等待路由器上线 ...', flush=True)
     end = time.time() + timeout
     while time.time() < end:
@@ -311,6 +316,11 @@ def deep_persist(ip, rootpw):
     sh.close()
     wait_router_down(ip)
     sh = wait_router_up(ip, rootpw)
+
+    # 调试引导循环会清空 /data 和 overlay 配置, 需重新开启 dropbear 并重装 auto_ssh
+    print('  [收尾] 恢复 dropbear 并重装 auto_ssh 自启 ...')
+    sh.run('sed -i \'s/channel=.*/channel="debug"/g\' /etc/init.d/dropbear && /etc/init.d/dropbear start')
+    _install_auto_ssh(sh)
     sh.close()
     return True
 
