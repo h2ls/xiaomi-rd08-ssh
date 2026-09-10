@@ -8,15 +8,39 @@
 > IP/管理密码，开启前二次确认；菜单含「临时开启」「软固化（开机自启）」「深度固化（bdata/crash，
 > 三次重启，参考 [Wetoria/xiaomi-be6500pro](https://github.com/Wetoria/xiaomi-be6500pro)）」。
 > 依赖：`pip install requests ssh2-python`，然后 `python rd08_ssh_enable.py` 即可。
-> .NET 移植版：[`Rd08SshTool/`](./Rd08SshTool)（功能与 Python 版一致，仅依赖 NuGet 包 SSH.NET，
+> .NET 移植版：[`Rd08SshTool/`](./Rd08SshTool)（提供相同菜单功能，本次 Python 可靠性修复尚未同步，仅依赖 NuGet 包 SSH.NET，
 > `dotnet run --project Rd08SshTool` 即可运行）。
+
+Python 脚本现在要求手动输入非空 root 密码，在支持的终端中隐藏交互输入并保留密码首尾空格；
+密码按 Base64 数据传输，不再直接拼入 Shell，不接受换行、NUL 等控制字符。
+Base64 只是编码，不提供加密。开启完成后会用该密码实际验证 SSH root 登录。
+
+Windows 终端输入密码时不会显示字符或星号，输入完成后按回车即可。
+在 Python IDLE Shell 等不提供原生控制台输入的环境中，脚本会提示并改用普通输入，
+密码可能可见；如需隐藏密码，请从 Windows 终端运行脚本。
+
+SSH/Telnet 命令会检查执行结果，超时或连接异常不再作为成功返回；Telnet 会验证登录和
+root 身份，并区分命令回显与真正的结束标记。软固化会校验脚本内容、权限、语法和 UCI 配置，
+但安装校验不等于已验证开机自启。深度固化在每次重启时检查下线状态和启动编号变化，
+在关键步骤检查 bdata/nvram 值；任何失败都会停止并显示中断阶段，不应直接从第 1 步重跑。
+这些检查不构成对固件漏洞、分区操作或升级/恢复出厂后行为的实机验证。
+
+本地回归测试（不会连接路由器或写分区）：
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+测试使用脚本现有的 `requests`、`ssh2-python` 依赖。可选安装 `paramiko` 后，
+还会运行仅监听 `127.0.0.1` 的 SSH 协议测试；未安装时自动跳过。
 
 ---
 
 ## 0. 风险与法律边界
 
 - 仅对**自己的设备**操作；认证后 RCE 需要管理密码，不降低他人设备安全性。
-- 开 SSH 本身不改分区、可逆（重启即失效）；备份/固化等操作见 §6 风险提示。
+- 开启流程会修改 root 密码并提交 `ssh_en`/`telnet_en` 到 nvram；dropbear 的临时修改通常在重启后失效，
+  不代表所有改动都会还原。备份/固化等操作见 §6 风险提示。
 - 该漏洞建议上报小米安全中心（security.mi.com）。
 
 ## 1. 侦查（无凭据信息获取）

