@@ -4,7 +4,10 @@
 
 > 适用对象：固件 1.1.96（已带 hackCheck v3 字符过滤，xmir-patcher 全部 exploit 失效）的小米 RD08。
 > 核心成果：发现并验证一个新注入点（`set_macfilter_rules` 的 `name` 参数），认证后 root RCE，一键开 SSH。
-> 配套脚本：[`rd08_ssh_enable.py`](./rd08_ssh_enable.py)（实测可用）。
+> 配套工具：[`rd08_ssh_enable.py`](./rd08_ssh_enable.py)（实测可用）——交互式引导输入
+> IP/管理密码，开启前二次确认；菜单含「临时开启」「软固化（开机自启）」「深度固化（bdata/crash，
+> 三次重启，参考 [Wetoria/xiaomi-be6500pro](https://github.com/Wetoria/xiaomi-be6500pro)）」。
+> 依赖：`pip install requests ssh2-python`，然后 `python rd08_ssh_enable.py` 即可。
 
 ---
 
