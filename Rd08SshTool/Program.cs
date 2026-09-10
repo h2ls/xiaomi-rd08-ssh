@@ -167,16 +167,12 @@ namespace Rd08SshTool
                 if (key.Key == ConsoleKey.Backspace)
                 {
                     if (sb.Length > 0)
-                    {
                         sb.Length--;
-                        Console.Write("\b \b");
-                    }
                     continue;
                 }
                 if (!char.IsControl(key.KeyChar))
                 {
                     sb.Append(key.KeyChar);
-                    Console.Write('*');
                 }
             }
         }
