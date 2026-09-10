@@ -3,3 +3,5 @@ __pycache__/
 obj/
 bin/
 .vs/
+*.user
+/Rd08SshTool.exe
